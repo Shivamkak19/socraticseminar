@@ -10,5 +10,4 @@ regex==2024.5.15
 pandas==2.2.2
 python-dotenv==1.0.1
 llamaapi==0.1.36
-futures==3.4.0
 dataclasses==0.6
