@@ -1,8 +1,6 @@
 from dataclasses import dataclass
 from typing import List, Optional, Union, Dict, Any
 import asyncio
-import random
-from enum import Enum
 import time
 
 from debateTypes import (
