@@ -11,3 +11,4 @@ pandas==2.2.2
 python-dotenv==1.0.1
 llamaapi==0.1.36
 dataclasses==0.6
+gunicorn==21.2.0
