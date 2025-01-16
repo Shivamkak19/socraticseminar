@@ -1,4 +1,5 @@
 flask==3.0.0
+flask-cors==4.0.0
 google-cloud-aiplatform==1.76.0
 google-auth==2.30.0
 google-api-core==2.19.0
