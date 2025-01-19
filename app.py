@@ -1,17 +1,14 @@
 from flask import Flask, jsonify, request
 from debateTypes import GeneralInput, GENERAL_TASK, Agent
-from debate import Debate
+from debate import Debate, RaftConsensus
 import asyncio
 import threading
 from flask_cors import CORS
 
-
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+CORS(app)
 
-# Store active debates
 active_debates = {}
-
 
 class DebateManager:
     def __init__(self):
@@ -20,64 +17,59 @@ class DebateManager:
         self.is_complete = False
         self.final_answer = None
         self.current_round = 0
+        self.raft_consensus = None
+        self.agent_roles = None
+        self.current_leader = None
 
-
-def run_debate_async(
-    debate_id,
-    prompt,
-    num_rounds,
-    num_agents,
-    summarize_context,
-    use_reflection,
-    summarize_final_answer=True,
-):
+def run_debate_async(debate_id, prompt, num_rounds, num_agents, summarize_context, 
+                    use_reflection, raft, summarize_final_answer=True):
     """Run debate asynchronously and store results."""
 
     async def run():
         try:
-            # Create new debate instance
             debate = Debate(model_name="llama70b", use_llama_api=True)
-
-            # Store debate instance
             active_debates[debate_id].debate = debate
 
-            # Initialize debate parameters
             task = GENERAL_TASK
             augment_prompt = prompt + "Keep answer short, sweet, to the point."
             task_input = GeneralInput(prompt=augment_prompt)
 
-            # Initialize agents
-            debate.agents = [
-                Agent(i, debate.model_name, use_llama_api=True)
-                for i in range(num_agents)
-            ]
+            debate.agents = [Agent(i, debate.model_name, use_llama_api=True) 
+                           for i in range(num_agents)]
+
+            # Initialize RAFT consensus if enabled
+            raft_consensus = None
+            leader_context = None
+
+            if raft:
+                raft_consensus = RaftConsensus(num_agents)
+                active_debates[debate_id].raft_consensus = raft_consensus
+                agent_roles = await raft_consensus.generate_roles(
+                    task.task_type, debate.agents[0]
+                )
+                active_debates[debate_id].agent_roles = agent_roles
+                leader_id = await raft_consensus.initial_election(
+                    debate.agents[0], agent_roles
+                )
+                active_debates[debate_id].current_leader = leader_id
+                leader_context = {"leader": leader_id, "roles": agent_roles}
 
             # Run debate round by round
             for round_num in range(num_rounds):
-                # Format prompt based on round number
                 if round_num == 0:
                     current_prompt = task.format_prompt(task_input)
                 else:
-                    context = (
-                        await debate._summarize_context(
-                            active_debates[debate_id].debate_history[-1]
-                        )
-                        if summarize_context
-                        else "\n".join(active_debates[debate_id].debate_history[-1])
-                    )
-                    current_prompt = task.debate_prompt.format(
-                        context=context, round_num=round_num + 1
-                    )
+                    context = (await debate._summarize_context(active_debates[debate_id].debate_history[-1])
+                             if summarize_context else "\n".join(active_debates[debate_id].debate_history[-1]))
+                    current_prompt = task.debate_prompt.format(context=context, round_num=round_num + 1)
 
-                # Get responses for this round
                 responses = await debate._get_parallel_responses(
-                    current_prompt, debate.agents
+                    current_prompt, 
+                    debate.agents,
+                    leader_context if raft else None
                 )
-                cleaned_responses = [
-                    debate._clean_response(response) for response in responses
-                ]
+                cleaned_responses = [debate._clean_response(response) for response in responses]
 
-                # Run reflection if enabled
                 if use_reflection:
                     reflection_tasks = []
                     for i, response in enumerate(cleaned_responses):
@@ -88,16 +80,22 @@ def run_debate_async(
                         )
                         reflection_tasks.append(reflection_task)
                     reflected_responses = await asyncio.gather(*reflection_tasks)
-                    cleaned_responses = [
-                        debate._clean_response(response)
-                        for response in reflected_responses
-                    ]
+                    cleaned_responses = [debate._clean_response(response) 
+                                      for response in reflected_responses]
 
-                # Update debate history in real-time
                 active_debates[debate_id].debate_history.append(cleaned_responses)
                 active_debates[debate_id].current_round = round_num + 1
 
-            # Generate final summary if enabled
+                if raft and raft_consensus and round_num < num_rounds - 1:
+                    new_leader = await raft_consensus.evaluate_leadership(
+                        debate.agents[0],
+                        leader_context["leader"],
+                        cleaned_responses,
+                        leader_context["roles"]
+                    )
+                    leader_context["leader"] = new_leader
+                    active_debates[debate_id].current_leader = new_leader
+
             if summarize_final_answer:
                 final_summary = await debate._summarize_context(
                     active_debates[debate_id].debate_history[-1]
@@ -111,75 +109,45 @@ def run_debate_async(
             active_debates[debate_id].is_complete = True
             active_debates[debate_id].error = str(e)
 
-    # Create event loop and run debate
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(run())
     loop.close()
 
-
 @app.route("/debate", methods=["POST"])
 def start_debate():
     data = request.json
 
-    # Validate required input
-    required_fields = [
-        "prompt",
-        "num_rounds",
-        "num_agents",
-        "summarize_context",
-        "use_reflection",
-        "stream",
-    ]
+    required_fields = ["prompt", "num_rounds", "num_agents", 
+                      "summarize_context", "use_reflection", "stream", "raft"]
     if not all(field in data for field in required_fields):
         return jsonify({"error": "Missing required fields"}), 400
 
-    # Set default for summarize_final_answer
     summarize_final_answer = data.get("summarize_final_answer", True)
-
-    # Generate unique debate ID
     debate_id = str(len(active_debates))
-
-    # Initialize debate manager
     active_debates[debate_id] = DebateManager()
 
     if data["stream"]:
-        # Start debate in background
         thread = threading.Thread(
             target=run_debate_async,
-            args=(
-                debate_id,
-                data["prompt"],
-                data["num_rounds"],
-                data["num_agents"],
-                data["summarize_context"],
-                data["use_reflection"],
-                summarize_final_answer,
-            ),
+            args=(debate_id, data["prompt"], data["num_rounds"], 
+                  data["num_agents"], data["summarize_context"], 
+                  data["use_reflection"], data["raft"], 
+                  summarize_final_answer),
         )
         thread.start()
-
         return jsonify({"debate_id": debate_id, "status": "started", "stream": True})
     else:
-        # Run debate synchronously
         run_debate_async(
-            debate_id,
-            data["prompt"],
-            data["num_rounds"],
-            data["num_agents"],
-            data["summarize_context"],
-            data["use_reflection"],
-            summarize_final_answer,
+            debate_id, data["prompt"], data["num_rounds"], 
+            data["num_agents"], data["summarize_context"], 
+            data["use_reflection"], data["raft"], 
+            summarize_final_answer
         )
-
-        # Return complete results
-        return jsonify(
-            {
-                "debate_history": active_debates[debate_id].debate_history,
-                "final_answer": active_debates[debate_id].final_answer,
-            }
-        )
-
+        return jsonify({
+            "debate_history": active_debates[debate_id].debate_history,
+            "final_answer": active_debates[debate_id].final_answer
+        })
 
 @app.route("/debate/<debate_id>/status", methods=["GET"])
 def get_debate_status(debate_id):
@@ -194,14 +162,13 @@ def get_debate_status(debate_id):
     response = {
         "status": "complete" if debate_manager.is_complete else "in_progress",
         "debate_history": debate_manager.debate_history,
-        "current_round": debate_manager.current_round,
+        "current_round": debate_manager.current_round
     }
 
     if debate_manager.is_complete:
         response["final_answer"] = debate_manager.final_answer
 
     return jsonify(response)
-
 
 if __name__ == "__main__":
     app.run(debug=True)

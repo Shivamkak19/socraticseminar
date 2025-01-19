@@ -29,6 +29,161 @@ import regex as re
 import concurrent.futures
 
 
+class RaftConsensus:
+    """Manages RAFT-style leader election and consensus within debates."""
+
+    def __init__(self, num_agents: int):
+        self.num_agents = num_agents
+        self.current_leader = None
+        self.agent_roles = {}
+        self.majority_threshold = (
+            (num_agents // 2) + 1 if num_agents % 2 != 0 else (num_agents // 2)
+        )
+
+    async def generate_roles(self, task_type: TaskType, agent: Agent) -> Dict[int, str]:
+        """Generates appropriate roles for agents based on task type."""
+        # Define default roles based on task type
+        default_roles = {
+            TaskType.ARITHMETIC: [
+                "Mathematics Professor",
+                "Data Scientist",
+                "High School Math Teacher",
+                "Local Town Idiot",
+            ],
+            TaskType.GSM8K: [
+                "Mathematical Modeler",
+                "IMO Gold Medalist",
+                "Math Competition Coach",
+                "Local Town Idiot",
+            ],
+            TaskType.CHESS: [
+                "Chess Grandmaster",
+                "Professional Chess Player",
+                "Amateur Chess Enthusiast",
+                "Local Town Idiot",
+            ],
+            TaskType.MMLU: [
+                "Subject Matter Expert",
+                "University Professor",
+                "Graduate Student",
+                "Local Town Idiot",
+            ],
+            TaskType.GENERAL: [
+                "Domain Expert",
+                "Research Analyst",
+                "Brilliant Child Genius",
+                "Local Town Idiot",
+            ],
+        }
+
+        role_prompt = f"""Generate {self.num_agents} roles for a debate about a {task_type.value} problem.
+        Roles should be relevant to the task and range from highly qualified to less qualified.
+        Format your response as a simple comma-separated list like this:
+        Mathematics Professor, High School Teacher, Student
+        Your response should ONLY contain the comma-separated list, nothing else."""
+
+        try:
+            response = await agent.generate_response(role_prompt)
+
+            if response:
+                # Clean the response and split by commas
+                roles_list = [
+                    role.strip().strip('"').strip("'")
+                    for role in response.strip().split(",")
+                    if role.strip()
+                ]
+
+                if roles_list:
+                    # If we got more roles than needed, take the first N
+                    # If we got fewer roles than needed, we'll cycle through them
+                    roles = {
+                        i: roles_list[i % len(roles_list)]
+                        for i in range(self.num_agents)
+                    }
+                    return roles
+
+            # If parsing fails, use default roles
+            base_roles = default_roles.get(task_type, default_roles[TaskType.GENERAL])
+            roles = {i: base_roles[i % len(base_roles)] for i in range(self.num_agents)}
+            return roles
+
+        except Exception as e:
+            print(f"Error in role generation: {e}")
+            # Ultimate fallback
+            return {i: f"Agent {i}" for i in range(self.num_agents)}
+
+    async def initial_election(self, agent: Agent, agent_roles: Dict[int, str]) -> int:
+        """Conducts initial leader election based on agent roles."""
+        election_prompt = f"""Given these agent roles for a debate:
+        {agent_roles}
+        
+        Each agent should vote for who they think should lead the debate based on qualifications.
+        Generate {self.num_agents} votes (one for each agent). Format response as a Python list 
+        of agent IDs that each agent votes for."""
+
+        response = await agent.generate_response(election_prompt)
+        try:
+            # Extract list from response using regex or eval
+            import re
+
+            votes_str = re.search(r"\[.*\]", response).group()
+            votes = eval(votes_str)
+
+            # Count votes and determine leader
+            from collections import Counter
+
+            vote_counts = Counter(votes)
+            leader_id = max(vote_counts.items(), key=lambda x: x[1])[0]
+
+            return leader_id
+        except Exception as e:
+            print(f"Error in election: {e}")
+            return 0  # Default to first agent as leader
+
+    async def evaluate_leadership(
+        self,
+        agent: Agent,
+        current_leader: int,
+        round_responses: List[str],
+        agent_roles: Dict[int, str],
+    ) -> int:
+        """Evaluates current leadership and determines if re-election is needed."""
+        eval_prompt = f"""Given the current debate state:
+        Current leader: Agent {current_leader} ({agent_roles[current_leader]})
+        
+        Round responses from agents:
+        {round_responses}
+        
+        Agent roles:
+        {agent_roles}
+        
+        Should leadership change? Consider:
+        1. Quality and correctness of responses
+        2. Leadership effectiveness
+        3. Alternative qualified candidates
+
+        Respond with either:
+        - "maintain" to keep current leader
+        - Or the agent ID (0-{self.num_agents-1}) of the new proposed leader"""
+
+        response = await agent.generate_response(eval_prompt)
+
+        if "maintain" in response.lower():
+            return current_leader
+
+        try:
+            # Try to extract new leader ID
+            import re
+
+            new_leader = int(re.search(r"\d+", response).group())
+            if 0 <= new_leader < self.num_agents:
+                return new_leader
+        except:
+            pass
+
+        return current_leader
+
+
 class Debate:
     """Manages a multi-agent debate process with parallel agent responses within rounds."""
 
@@ -38,20 +193,6 @@ class Debate:
         self.agents = []
         self.debate_history = []
         self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=10)
-
-    async def _get_parallel_responses(
-        self, prompt: str, agents: List[Agent]
-    ) -> List[str]:
-        """Gets responses from multiple agents in parallel for a single round."""
-        # Create tasks for each agent's response
-        tasks = []
-        for agent in agents:
-            task = asyncio.create_task(agent.generate_response(prompt))
-            tasks.append(task)
-
-        # Wait for all responses
-        responses = await asyncio.gather(*tasks)
-        return responses
 
     def _clean_response(self, response: str) -> str:
         """Cleans the model response to extract just the content."""
@@ -87,6 +228,31 @@ class Debate:
         summary = await summarizer.generate_response(summary_prompt)
         return self._clean_response(summary)
 
+    async def _get_parallel_responses(
+        self, prompt: str, agents: List[Agent], leader_context: Optional[Dict] = None
+    ) -> List[str]:
+        """Gets responses from multiple agents in parallel for a single round."""
+        tasks = []
+        for agent in agents:
+            # Add leader context to prompt if available
+            if leader_context:
+                agent_role = leader_context["roles"][agent.agent_id]
+                is_leader = agent.agent_id == leader_context["leader"]
+                contextualized_prompt = f"""You are acting as: {agent_role}
+                {' (Current Debate Leader)' if is_leader else ''}
+                
+                Current debate leader is: {leader_context['roles'][leader_context['leader']]}
+                
+                {prompt}"""
+            else:
+                contextualized_prompt = prompt
+
+            task = asyncio.create_task(agent.generate_response(contextualized_prompt))
+            tasks.append(task)
+
+        responses = await asyncio.gather(*tasks)
+        return responses
+
     async def run_debate(
         self,
         task: Task,
@@ -95,6 +261,7 @@ class Debate:
         num_agents: int,
         summarize_context: bool = False,
         use_reflection: bool = False,
+        raft: bool = False,
         summarize_final_answer: bool = False,
     ) -> List[List[str]]:
         """Runs a debate for specified number of rounds with given number of agents."""
@@ -105,26 +272,39 @@ class Debate:
         ]
         self.debate_history = []
 
-        # Run all rounds including the first one
+        # Initialize RAFT consensus if enabled
+        raft_consensus = None
+        leader_context = None
+
+        if raft:
+            raft_consensus = RaftConsensus(num_agents)
+            # Generate roles using first agent as coordinator
+            agent_roles = await raft_consensus.generate_roles(
+                task.task_type, self.agents[0]
+            )
+            # Conduct initial leader election
+            leader_id = await raft_consensus.initial_election(
+                self.agents[0], agent_roles
+            )
+            leader_context = {"leader": leader_id, "roles": agent_roles}
+
+        # Run all rounds
         for round_num in range(num_rounds):
             # Format prompt based on round number
             if round_num == 0:
-                # First round uses the initial prompt
                 prompt = task.format_prompt(task_input)
             else:
-                # Get context from previous round
                 context = (
                     await self._summarize_context(self.debate_history[-1])
                     if summarize_context
                     else "\n".join(self.debate_history[-1])
                 )
-                # Subsequent rounds use the debate prompt
-                prompt = task.debate_prompt.format(
-                    context=context, round_num=round_num + 1
-                )
+                prompt = task.debate_prompt.format(context=context)
 
             # Get responses for this round
-            responses = await self._get_parallel_responses(prompt, self.agents)
+            responses = await self._get_parallel_responses(
+                prompt, self.agents, leader_context
+            )
             cleaned_responses = [
                 self._clean_response(response) for response in responses
             ]
@@ -145,6 +325,18 @@ class Debate:
                 ]
 
             self.debate_history.append(cleaned_responses)
+
+            # Evaluate leadership after each round if RAFT is enabled
+            if (
+                raft and raft_consensus and round_num < num_rounds - 1
+            ):  # Skip last round
+                new_leader = await raft_consensus.evaluate_leadership(
+                    self.agents[0],  # Use first agent as coordinator
+                    leader_context["leader"],
+                    cleaned_responses,
+                    leader_context["roles"],
+                )
+                leader_context["leader"] = new_leader
 
         # Optionally summarize final round responses
         if summarize_final_answer:
@@ -269,6 +461,7 @@ async def main():
         num_agents=5,
         summarize_context=True,
         use_reflection=False,
+        raft=False,
         summarize_final_answer=True,
     )
     print_debate_results(general_responses)

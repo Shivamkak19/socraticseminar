@@ -109,10 +109,19 @@ class Task:
             return self.starting_prompt.format(person=task_input.person)
         elif self.task_type == TaskType.MMLU:
             assert isinstance(task_input, MMLUInput)
-            return self.starting_prompt.format(
-                question=task_input.question,
-                **{k: v for k, v in task_input.choices.items()},
-            )
+            prompt_vars = {
+                "question": task_input.question,
+                "a": task_input.choices["A"],
+                "b": task_input.choices["B"],
+                "c": task_input.choices["C"],
+                "d": task_input.choices["D"],
+            }
+            return self.starting_prompt.format(**prompt_vars)
+        elif self.task_type == TaskType.CHESS:
+            assert isinstance(task_input, ChessInput)
+            # Format moves in a more readable way with newlines between move pairs
+            formatted_moves = " ".join(task_input.moves)
+            return self.starting_prompt.format(moves=formatted_moves)
         elif self.task_type == TaskType.CHESS_VALIDITY:
             assert isinstance(task_input, ChessValidityInput)
             return self.starting_prompt.format(
@@ -149,9 +158,17 @@ GSM8K_TASK = Task(
 
 CHESS_TASK = Task(
     task_type=TaskType.CHESS,
-    starting_prompt="Here is the current sequence of moves in a chess game: {moves}. What is the best chess move I should execute next? Give a single move suggestion of the form 14. <XXX> and make sure the chess move is valid in the current board state.",
-    debate_prompt="Here are other chess move suggestions from other agents: {context} Using the chess suggestions from other agents as additional advice, can you give me your updated thoughts on the best next chess move I should play given the chess sequence? Give a single move suggestion of the form 14. <XXX> and make sure the chess move is valid in the current board state.",
-    reflection_prompt="Here is your original response: {original_response}\n\nGiven the board state and your previous move suggestion, can you confirm your best next chess move? Give a single move suggestion of the form 14. <XXX> and make sure the chess move is valid in the current board state.",
+    starting_prompt="""Here is the current chess position after these moves:
+    {moves}
+
+    What is the best next move? Consider:
+    1. The current position's key features
+    2. Potential tactical opportunities
+    3. Strategic plans
+
+    Give your move in the format: 14. <move> (e.g., 14. Nf3)""",
+    debate_prompt="Other agents suggest these moves with reasoning: {context}\n\nConsidering their analysis, what move do you recommend? Provide your reasoning and final move in the format: 14. <move>",
+    reflection_prompt="You suggested: {original_response}\n\nIs this move still best after reflection? State your final move in the format: 14. <move>",
 )
 
 BIOGRAPHIES_TASK = Task(
@@ -163,9 +180,19 @@ BIOGRAPHIES_TASK = Task(
 
 MMLU_TASK = Task(
     task_type=TaskType.MMLU,
-    starting_prompt="Can you answer the following question as accurately as possible? : {question} A) {a}, B) {b}, C) {c}, D) {d} Explain your answer, putting the answer in the form (X) at the end of your response.",
-    debate_prompt="These are the solutions to the problem from other agents: {context} Using the reasoning from other agents as additional advice, can you give an updated answer? Examine your solution and that other agents. Put your answer in the form (X) at the end of your response.",
-    reflection_prompt="Here is your original response: {original_response}\n\nCan you double check that your answer is correct? Put your final answer in the form (X) at the end of your response.",
+    starting_prompt="""Here is a multiple choice question:
+
+Question: {question}
+
+Choose from:
+A) {a}
+B) {b}
+C) {c}
+D) {d}
+
+Please explain your reasoning step by step, then provide your final answer in the form (X) where X is A, B, C, or D.""",
+    debate_prompt="Previous agents have provided these answers with reasoning: {context}\n\nConsidering their reasoning, what is your answer? Explain your thinking and put your final answer in the form (X).",
+    reflection_prompt="Your original response was: {original_response}\n\nAre you confident in this answer? Please verify your reasoning and provide your final answer in the form (X).",
 )
 
 CHESS_VALIDITY_TASK = Task(
